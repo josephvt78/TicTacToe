@@ -8,115 +8,188 @@
 import SwiftUI
 import RealityKit
 
-struct ContentView: View {
-    var body: some View {
-        ZStack {
-            RealityView { content in
-                // If iOS device that is not the simulator,
-                // use the spatial tracking camera.
-                #if os(iOS) && !targetEnvironment(simulator)
-                content.camera = .spatialTracking
-                #endif
-                createGameScene(content)
-            }.gesture(tapEntityGesture)
-            // When this app runs on macOS or iOS simulator,
-            // add camera controls that orbit the origin.
-            #if os(macOS) || (os(iOS) && targetEnvironment(simulator))
-            .realityViewCameraControls(.orbit)
-            #endif
+// MARK: - Model
+enum Player: String, Codable, CaseIterable, Equatable {
+    case x = "X"
+    case o = "O"
 
-            // Add instructions to tap the cube.
-            VStack {
-                Spacer()
-                Text("Tap the cube to spin!")
-            }.padding()
+    var next: Player { self == .x ? .o : .x }
+}
+
+struct GameState: Equatable, Codable {
+    var board: [Player?] = Array(repeating: nil, count: 9)
+    var current: Player = .x
+    var winner: Player? = nil
+
+    var isBoardFull: Bool { !board.contains(where: { $0 == nil }) }
+    var isDraw: Bool { winner == nil && isBoardFull }
+
+    mutating func reset() {
+        board = Array(repeating: nil, count: 9)
+        current = .x
+        winner = nil
+    }
+
+    mutating func makeMove(at index: Int) {
+        guard (0..<9).contains(index), winner == nil, board[index] == nil else { return }
+        board[index] = current
+        if let w = checkWinner() {
+            winner = w
+        } else if !isBoardFull {
+            current = current.next
         }
     }
 
-    /// A gesture that spins entities that have a spin component.
-    var tapEntityGesture: some Gesture {
-        TapGesture().targetedToEntity(where: .has(SpinComponent.self))
-            .onEnded({ gesture in
-                try? spinEntity(gesture.entity)
-            })
-    }
-
-    /// Creates a game scene and adds it to the view content.
-    ///
-    /// - Parameter content: The active content for this RealityKit game.
-    fileprivate func createGameScene(_ content: any RealityViewContentProtocol) {
-        let boxSize: SIMD3<Float> = [0.2, 0.2, 0.2]
-        // A component that shows a red box model.
-        let boxModel = ModelComponent(
-            mesh: .generateBox(size: boxSize),
-            materials: [SimpleMaterial(color: .red, isMetallic: true)]
-        )
-        // Components that allow interaction and visual feedback.
-        let inputTargetComponent = InputTargetComponent()
-        let hoverComponent = HoverEffectComponent()
-
-        // A component that sets the collision shape.
-        let boxCollision = CollisionComponent(shapes: [.generateBox(size: boxSize)])
-
-        // A component that stores spin information.
-        let spinComponent = SpinComponent()
-
-        // Set all the entity's components.
-        let boxEntity = Entity()
-        boxEntity.components.set([
-            boxModel, boxCollision, inputTargetComponent, hoverComponent,
-            spinComponent
-        ])
-
-        // Add the entity to the RealityView content.
-        content.add(boxEntity)
-
-        // If iOS device, except simulator.
-        #if os(iOS) && !targetEnvironment(simulator)
-        // Create an anchor target that is any floor surface
-        // greater than or equal to a 1x1m area.
-        let anchorTarget: AnchoringComponent.Target = .plane(
-            .horizontal, classification: .floor,
-            minimumBounds: .one
-        )
-        boxEntity.components.set(AnchoringComponent(anchorTarget))
-        // Move boxEntity up by half the box height, so that its base is on the ground.
-        boxEntity.position.y += boxSize.y / 2
-        #elseif os(macOS) || os(iOS)
-        // If macOS, or iOS simulator, add a perspective camera to the scene.
-        let camera = Entity()
-        camera.components.set(PerspectiveCameraComponent())
-        content.add(camera)
-
-        // Set the camera position and orientation.
-        let cameraLocation: SIMD3<Float> = [1, 1, 2]
-        camera.look(at: .zero, from: cameraLocation, relativeTo: nil)
-        #endif
-    }
-
-    /// Spins an entity around the y-axis.
-    /// - Parameter entity: The entity to spin.
-    func spinEntity(_ entity: Entity) throws {
-        // Get the entity's spin component.
-        guard let spinComponent = entity.components[SpinComponent.self]
-        else { return }
-
-        // Create a spin action that makes one revolution
-        // around the axis from the component.
-        let spinAction = SpinAction(revolutions: 1, localAxis: spinComponent.spinAxis)
-
-        // Create a one second animation that spins an entity.
-        let spinAnimation = try AnimationResource.makeActionAnimation(
-            for: spinAction,
-            duration: 1,
-            bindTarget: .transform
-        )
-
-        // Play the animation that spins the entity.
-        entity.playAnimation(spinAnimation)
+    func checkWinner() -> Player? {
+        let lines = [
+            [0,1,2],[3,4,5],[6,7,8], // rows
+            [0,3,6],[1,4,7],[2,5,8], // cols
+            [0,4,8],[2,4,6]          // diagonals
+        ]
+        for line in lines {
+            if let p = board[line[0]], board[line[1]] == p, board[line[2]] == p {
+                return p
+            }
+        }
+        return nil
     }
 }
 
-#Preview {
-    ContentView()
+// MARK: - ViewModel (Observable)
+@Observable
+final class GameViewModel {
+    var state = GameState()
+
+    func tap(_ index: Int) {
+        state.makeMove(at: index)
+    }
+
+    func reset() { state.reset() }
+}
+
+// MARK: - Views
+struct GameView: View {
+    @State private var vm = GameViewModel()
+    @State private var showResult = false
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
+
+    var body: some View {
+        VStack(spacing: 16) {
+            header
+            board
+            footer
+        }
+        .padding(24)
+        .frame(minWidth: 320, idealWidth: 420)
+        .onChange(of: vm.state.winner) { _, new in
+            showResult = new != nil || vm.state.isDraw
+        }
+        .alert(resultTitle, isPresented: $showResult) {
+            Button("New Game") { vm.reset() }
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(resultMessage)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .newGame)) { _ in
+            vm.reset()
+        }
+        .toolbar { toolbar }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .automatic) {
+            Button {
+                vm.reset()
+            } label: {
+                Label("New Game", systemImage: "arrow.clockwise")
+            }
+            .help("Start a new game")
+        }
+    }
+
+    private var header: some View {
+        VStack(spacing: 4) {
+            Text("Tic‑Tac‑Toe")
+                .font(.largeTitle).bold()
+            Text(statusText)
+                .font(.title3)
+                .accessibilityLabel("Status: \(statusText)")
+        }
+    }
+
+    private var board: some View {
+        LazyVGrid(columns: columns, spacing: 12) {
+            ForEach(0..<9, id: \.self) { idx in
+                SquareView(symbol: vm.state.board[idx]?.rawValue)
+                    .onTapGesture { vm.tap(idx) }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityLabel("Cell \(idx + 1)")
+                    .accessibilityHint(vm.state.board[idx] == nil ? "Place \(vm.state.current.rawValue)" : "Occupied")
+            }
+        }
+        .padding(4)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 12) {
+            Button {
+                vm.reset()
+            } label: {
+                Label("New Game", systemImage: "sparkles")
+            }
+            .buttonStyle(.borderedProminent)
+
+            Spacer()
+
+            Text("Current: \(vm.state.current.rawValue)")
+                .font(.headline)
+        }
+    }
+
+    private var statusText: String {
+        if let w = vm.state.winner { return "Winner: \(w.rawValue)" }
+        if vm.state.isDraw { return "Draw" }
+        return "Turn: \(vm.state.current.rawValue)"
+    }
+
+    private var resultTitle: String {
+        if vm.state.isDraw { return "It's a draw" }
+        if let w = vm.state.winner { return "\(w.rawValue) wins!" }
+        return "Game Over"
+    }
+
+    private var resultMessage: String {
+        if vm.state.isDraw { return "No more moves left." }
+        if let w = vm.state.winner { return "Congratulations, Player \(w.rawValue)!" }
+        return "Thanks for playing."
+    }
+}
+
+struct SquareView: View {
+    let symbol: String?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 16)
+                .strokeBorder(lineWidth: 2)
+                .background(RoundedRectangle(cornerRadius: 16).fill(.thickMaterial))
+                .aspectRatio(1, contentMode: .fit)
+            Text(symbol ?? "")
+                .font(.system(size: 48, weight: .heavy, design: .rounded))
+                .minimumScaleFactor(0.5)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Preview
+#Preview("Game") {
+    GameView()
+}
+
+// MARK: - Notifications
+extension Notification.Name {
+    static let newGame = Notification.Name("NewGameNotification")
 }
